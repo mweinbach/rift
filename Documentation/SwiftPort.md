@@ -1,13 +1,13 @@
 # macOS Swift port
 
-The `rift-swift` branch packages Rift's macOS workspace lifecycle as the importable `Rift` SwiftPM product. The root package uses Swift tools 6.0 and supports macOS 13 and later. Rust sources, CLI sources, JavaScript bindings, and existing release scripts remain available as upstream reference material; the Swift package does not build or load them.
+This fork's `main` and `rift-swift` branches package Rift's macOS workspace lifecycle as the importable `Rift` SwiftPM product. The root package uses Swift tools 6.0 and supports macOS 13 and later. Rust sources, CLI sources, JavaScript bindings, and existing release scripts remain available as upstream reference material; the Swift package does not build or load them.
 
 ## Public API
 
-`RiftManager` is an actor that owns a SQLite registry. Its initializer is synchronous and throwing; calls to actor-isolated operations require `try await` from outside the actor.
+`RiftManager` is an actor that owns a SQLite registry. The asynchronous, throwing `open(databaseURL:)` factory performs filesystem and SQLite setup on a dispatch queue, avoiding blocking the caller. The synchronous, throwing initializer remains available. Calls to actor-isolated operations require `try await` from outside the actor and run on the manager's dedicated serial dispatch executor.
 
 ```swift
-let manager = try RiftManager(databaseURL: nil)
+let manager = try await RiftManager.open(databaseURL: nil)
 
 let outcome = try await manager.initialize(at: source)
 let created = try await manager.create(
@@ -35,7 +35,7 @@ let collected = try await manager.garbageCollect()
 | `removeAll(at:options:)` | Trashes descendants, preserves the selected workspace, and returns their original URLs. |
 | `garbageCollect()` | Deletes registered trash, prunes missing active entries when they have no existing registered descendants, and returns the affected URLs. |
 
-`CreateOptions` defaults to `copyMode: .filtered` and `hooks: .run`. `RemoveOptions` defaults to `hooks: .run`. Names and custom storage are optional; generated names are selected from available candidates. Initialization accepts an optional `@Sendable` progress callback with `.restoringMarker` and `.registeringWorkspace` events.
+`CreateOptions` defaults to `copyMode: .filtered` and `hooks: .run`. `RemoveOptions` defaults to `hooks: .run`. Names and custom storage are optional; generated names are selected from available candidates. Initialization accepts an optional `@Sendable` progress callback with `.restoringMarker` and `.registeringWorkspace` events. Callbacks execute on the manager's executor while the operation lock is held; keep them nonblocking and dispatch UI updates to the main actor.
 
 ## Registry and markers
 
@@ -45,7 +45,11 @@ Use `databaseURL:` for independent registries, including tests or tools that sho
 
 Initialization targets exactly the supplied directory. It does not select a Git root or an existing ancestor workspace. Other operations canonicalize their supplied directory and search its ancestors for a marker. A registered ancestor with a missing marker is an error until initialization restores the marker at that ancestor.
 
-The actor serializes calls made through one manager instance. Swift managers sharing the resolved database path also coordinate operations through an advisory `<database>.operations.lock` file. The upstream Rust implementation does not participate in this Swift operation lock. Filesystem changes, database changes, and external hook processes are separate steps; they do not form one atomic transaction.
+Canonical paths use the kernel's stored filename spelling, so case aliases on case-insensitive APFS volumes preserve workspace identity and cannot bypass containment checks.
+
+New managed roots and created workspaces must be physically disjoint from every active workspace and registered trash directory: neither path may contain the other. Initializing an already registered path can still restore its marker. A custom storage parent may contain managed directories when the selected destination is a disjoint sibling, but storage inside a managed or trash directory is rejected. Removal and collection also reject overlapping paths in older registries before changing those directories.
+
+The actor serializes calls made through one manager instance. Its dedicated dispatch executor runs synchronous filesystem operations, lock waits, and hook processes without occupying Swift's cooperative executor threads. Swift managers sharing the resolved database path also coordinate operations through an advisory `<database>.operations.lock` file. The upstream Rust implementation does not participate in this Swift operation lock. Filesystem changes, database changes, and external hook processes are separate steps; they do not form one atomic transaction.
 
 ## APFS copying
 
@@ -54,13 +58,13 @@ The port uses macOS `clonefile` for copy-on-write cloning and has no ordinary-co
 `.all` uses whole-tree cloning. `.filtered` clones included entries while excluding artifact components at any depth:
 
 ```text
-node_modules  .pnpm-store  target  .venv  venv  .tox  .nox
+.build  node_modules  .pnpm-store  target  .venv  venv  .tox  .nox
 __pycache__  .pytest_cache  .mypy_cache  .ruff_cache
 .next  .nuxt  .svelte-kit  .turbo  .vite  .parcel-cache  .cache
 dist  build  coverage
 ```
 
-Filtered mode also excludes `.yarn/cache`, `.yarn/unplugged`, `.yarn/install-state.gz`, and `.yarn/build-state.yml`. It preserves ordinary files, manifests, lockfiles, and included symbolic links. Filtered mode rejects special entries such as FIFOs; `.all` delegates the complete tree to native cloning, which can preserve those entries. `.all` is useful when artifact names are meaningful source content or a complete directory clone is required.
+Filtered mode also excludes `.yarn/cache`, `.yarn/unplugged`, `.yarn/install-state.gz`, and `.yarn/build-state.yml`. It preserves ordinary files, manifests, lockfiles, `.swiftpm` project configuration, and included symbolic links. Excluding `.build` is an intentional Swift-port extension to the upstream artifact filter, avoiding copies of SwiftPM checkouts and build caches. Filtered mode rejects special entries such as FIFOs; `.all` delegates the complete tree to native cloning, which can preserve those entries. `.all` is useful when artifact names are meaningful source content or a complete directory clone is required.
 
 Metadata follows macOS cloning and destination ACL inheritance behavior. `.all` uses native `clonefile` permission handling, which clears setuid/setgid bits; `.filtered` restores full Unix mode bits on included regular files and directories.
 
@@ -70,11 +74,13 @@ Rift rejects a destination within the source workspace and an existing destinati
 
 Git preparation uses `/usr/bin/git`. The new copy has detached `HEAD` and retains the source index and working-tree contents. Rift hides its marker through Git's local exclude configuration.
 
-Rift checks Git layout before cloning. Linked worktrees and other Git layouts that reference state outside the source directory cannot be treated as independent copies and are rejected. Git checks can also reject unsafe symlinked or external administrative paths. Initialization and creation can throw before filesystem copying when the Git layout is unsupported.
+Rift checks Git layout before cloning. Linked worktrees and other Git layouts that reference state outside the source directory cannot be treated as independent copies and are rejected. Git checks can also reject unsafe symlinked or external administrative paths, repository redirection, and unsupported reference storage. A malformed or unresolved `HEAD` is rejected; an unborn repository is allowed because it has no commit to detach. Initialization and creation can throw before filesystem copying when the Git layout is unsupported.
+
+Supported repositories use the `files` reference backend and independent object storage. Rift rejects explicit `core.worktree` settings, nonempty object alternates, bare administrative metadata, reftable storage, and repositories retaining linked-worktree metadata. These restrictions prevent copied Git commands from reading or modifying the original workspace.
 
 ## Lifecycle hooks
 
-The port reads version 1 `.rift.toml` configuration with the pure Swift `TOMLDecoder` dependency, pinned to version 0.4.5. The supported lifecycle arrays are `hooks.precreate`, `hooks.postcreate`, `hooks.preremove`, and `hooks.postremove`; each step supplies a nonempty `run` command. Unknown configuration fields and unsupported versions are rejected. Steps execute in configuration order through `/bin/sh -c`, inheriting the process environment and standard streams.
+The port reads version 1 `.rift.toml` configuration with the pure Swift `TOMLDecoder` dependency, pinned to version 0.4.5. The supported lifecycle arrays are `hooks.precreate`, `hooks.postcreate`, `hooks.preremove`, and `hooks.postremove`; each step supplies a nonempty `run` command. Unknown configuration fields, unsupported versions, and commands containing a NUL character are rejected. Steps execute in configuration order through `/bin/sh -c`, inheriting the process environment and standard streams.
 
 ```toml
 version = 1
@@ -105,13 +111,15 @@ Preremove hooks run in the selected workspace before removal, followed by revali
 
 Removing a created workspace verifies markers and real directory paths for its registered active subtree, then moves each workspace into adjacent `.trash/<id>-<name>` storage. Missing registered paths prevent subtree removal. A failed move or registry update attempts to roll back moves already performed.
 
-Removing a source root preserves that directory, removes its marker, and trashes existing registered descendants. Missing descendant registry entries are removed as part of unregistering the root. Unlike the Rust CLI, the Swift library has no force flag or interactive prompt: calling `remove(at:)` supplies the operation directly.
+Removing a source root preserves that directory, removes its marker, and trashes existing registered descendants. Missing descendant registry entries are removed as part of unregistering the root. If updating the registry fails, Rift attempts to restore the source marker and move descendants back. Unlike the Rust CLI, the Swift library has no force flag or interactive prompt: calling `remove(at:)` supplies the operation directly.
 
-`removeAll(at:)` preserves the selected workspace and removes only its descendants. `garbageCollect()` verifies each existing trash directory's marker before permanently deleting it, then prunes missing active entries when no existing registered descendants remain. Collection can make partial progress before an error; callers can retry it.
+Root unregistration publishes descendant trash and root deletion in one SQLite transaction. A failed filesystem recovery throws `rollbackFailed` with the original and recovery errors rather than hiding the incomplete rollback.
+
+`removeAll(at:)` preserves the selected workspace and removes only its descendants. `garbageCollect()` verifies each existing trash directory's marker before permanently deleting it, then prunes missing active entries when no existing registered descendants remain. Permission and other metadata-reading failures propagate rather than being treated as missing directories. Deletion makes owned directories writable and searchable and clears immutable flags as needed. It keeps the root marker until the remaining contents have been removed and attempts to restore it if final directory removal fails, preserving identity for a retry when possible. Collection can make partial progress before an error; callers can retry it.
 
 ## Errors and scope
 
-All registry and workspace operations throw. Typed Rift failures use `RiftError`; some Foundation filesystem errors also propagate directly. Errors cover invalid paths and names, unavailable cloning, uninitialized workspaces, missing or mismatched markers, unknown registry entries, existing destinations, unsafe Git layouts, unsupported filesystem entries, invalid hook configuration, failing hooks, filesystem failures, and SQLite failures. A post-hook error describes an operation whose primary change has already completed; query the registry before deciding to retry creation or removal.
+All registry and workspace operations throw. Typed Rift failures use `RiftError`; some Foundation filesystem errors also propagate directly. Errors cover invalid paths and names, unavailable cloning, uninitialized workspaces, missing or mismatched markers, unknown registry entries, existing destinations, overlapping managed paths, unsafe Git layouts, unsupported filesystem entries, invalid hook configuration, failing hooks, filesystem failures, and SQLite failures. Cyclic parent relationships in an invalid registry are rejected rather than traversed indefinitely. A post-hook error describes an operation whose primary change has already completed; query the registry before deciding to retry creation or removal.
 
 The Swift port focuses on macOS library use. It does not expose the Rust CLI, shell integration, JavaScript/FFI binding, Linux btrfs or reflink strategies, Windows support, or Rust benchmark executables. Its initialization progress callback reports macOS registration and marker restoration rather than Linux conversion stages, and its initialization outcome has no Linux-only `converted` case.
 
@@ -130,6 +138,6 @@ swift build --package-path Examples/SwiftPMConsumer
 swift run --package-path Examples/SwiftPMConsumer RiftExample
 ```
 
-The consumer smoke uses a newly created temporary directory and separate SQLite registry. It registers a source, clones it, verifies the cloned contents and parent listing, removes the clone, collects trash, and cleans up its fixture. It does not initialize or clone a user project.
+The consumer smoke uses a newly created temporary directory and separate SQLite registry. It registers a source, clones it, verifies the cloned contents, parent listing, `.build` exclusion, and mutation isolation, removes the clone, verifies trash collection, and cleans up its fixture. It does not initialize or clone a user project.
 
 Successful tests and builds validate the behaviors exercised by those checks. They do not establish parity across every filesystem, Git layout, hook script, concurrent process, or preexisting registry. Swift-port creation latency and storage behavior have not been benchmarked, and upstream Rust timing claims do not serve as Swift measurements.

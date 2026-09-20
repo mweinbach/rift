@@ -147,6 +147,57 @@ struct APFSClonerTests {
         }
     }
 
+    @Test(arguments: [CopyMode.filtered, .all])
+    func swiftBuildArtifactsAreFilteredWithoutDroppingPackageMetadata(mode: CopyMode) throws {
+        try withTemporaryDirectory { root in
+            let source = root.appendingPathComponent("source")
+            let destination = root.appendingPathComponent("destination")
+            for relative in [".build/checkouts/dependency", "packages/app/.build/debug", "Build", ".swiftpm/configuration"] {
+                let directory = source.appendingPathComponent(relative)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try Data("artifact or metadata".utf8).write(to: directory.appendingPathComponent("file"))
+            }
+            for name in ["Package.swift", "Package.resolved"] {
+                try Data("package metadata".utf8).write(to: source.appendingPathComponent(name))
+            }
+
+            try APFSCloner().copyDirectory(from: source, to: destination, mode: mode)
+
+            for relative in [".build", "packages/app/.build"] {
+                #expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent(relative).path) == (mode == .all))
+            }
+            for relative in ["Build/file", ".swiftpm/configuration/file", "Package.swift", "Package.resolved"] {
+                #expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent(relative).path))
+            }
+        }
+    }
+
+    @Test
+    func deletionDoesNotFollowSymbolicLinksOrModifyTheirTargets() throws {
+        try withTemporaryDirectory { root in
+            let outside = root.appendingPathComponent("outside")
+            let file = outside.appendingPathComponent("file")
+            let tree = root.appendingPathComponent("tree")
+            try mkdir(outside)
+            try mkdir(tree)
+            try Data("keep".utf8).write(to: file)
+            try setMode(outside, 0o555)
+            try setFlags(file, UInt32(UF_IMMUTABLE))
+            try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "../outside")
+            let rootLink = root.appendingPathComponent("root-link")
+            try FileManager.default.createSymbolicLink(atPath: rootLink.path, withDestinationPath: outside.path)
+
+            try APFSCloner().removeDirectory(at: tree)
+            try APFSCloner().removeDirectory(at: rootLink)
+
+            #expect(!FileManager.default.fileExists(atPath: tree.path))
+            #expect(!FileManager.default.fileExists(atPath: rootLink.path))
+            #expect(try Data(contentsOf: file) == Data("keep".utf8))
+            #expect(try metadata(outside).st_mode & 0o7777 == 0o555)
+            #expect(try metadata(file).st_flags & UInt32(UF_IMMUTABLE) != 0)
+        }
+    }
+
     @Test
     func filteredCopyPreservesImmutableHardLinks() throws {
         try withTemporaryDirectory { root in
@@ -236,12 +287,14 @@ struct APFSClonerTests {
         }
     }
 
-    @Test
-    func rejectsDestinationInsideSourceBeforeCreatingIt() throws {
+    @Test(arguments: [false, true])
+    func rejectsDestinationInsideSourceBeforeCreatingIt(useCaseAlias: Bool) throws {
         try withTemporaryDirectory { root in
             let source = root.appendingPathComponent("source")
             try mkdir(source)
-            let destination = source.appendingPathComponent("copy")
+            let selected = useCaseAlias ? root.appendingPathComponent("SOURCE") : source
+            if useCaseAlias, !FileManager.default.fileExists(atPath: selected.path) { return }
+            let destination = selected.appendingPathComponent("copy")
             do {
                 try APFSCloner().copyDirectory(from: source, to: destination, mode: .filtered)
                 Issue.record("A destination inside its source must be rejected")

@@ -64,6 +64,7 @@ struct HookConfigurationTests {
         "version = 1\n[hooks]\nunknown = []",
         "version = 1\n[[hooks.postcreate]]\nrun = 'echo ok'\nshell = 'sh'",
         "version = 1\n[[hooks.postcreate]]\nrun = '   '",
+        "version = 1\n[[hooks.postcreate]]\nrun = \"echo before\\u0000; echo after\"",
         "version = 1\n[[hooks.postcreate]]\nother = 'echo ok'",
         "version = 1\n[hooks]\npostcreate = ['echo ok']",
         "version = 1\n[[hooks.postcreate]]\nrun = 42",
@@ -115,6 +116,26 @@ struct HookConfigurationTests {
             #expect(message.contains("23"))
         }
         #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("should-not-exist").path))
+    }
+
+    @Test func nullByteCommandFailsBeforeLaunchingAndStopsRemainingSteps() throws {
+        let fixture = try HookFixture()
+        let command = "touch should-not-exist\u{0}; true"
+        do {
+            try HookRunner.run(
+                name: "precreate", steps: [command, "touch remaining-should-not-exist"],
+                currentDirectory: fixture.directory, source: fixture.directory, destination: fixture.directory,
+                id: "child-id", parentID: "parent-id"
+            )
+            Issue.record("Expected a command containing a null byte to fail")
+        } catch RiftError.hookFailed(let hook, let path, let rejectedCommand, let message) {
+            #expect(hook == "precreate")
+            #expect(path == fixture.directory)
+            #expect(rejectedCommand == command)
+            #expect(message.contains("null bytes"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("should-not-exist").path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("remaining-should-not-exist").path))
     }
 }
 

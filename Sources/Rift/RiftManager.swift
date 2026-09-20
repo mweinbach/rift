@@ -1,16 +1,23 @@
 import Foundation
+import Dispatch
 
 /// Manages macOS copy-on-write workspaces and their persistent ancestry.
 ///
 /// Operations are serialized within this actor and coordinated with other Swift
-/// managers using the same database. Filesystem work is synchronous within each
-/// operation; call from a task when integrating into an application.
+/// managers using the same database. Blocking filesystem work runs on a dedicated
+/// serial executor. Use `open(databaseURL:)` to open a registry asynchronously.
 public actor RiftManager {
+    private nonisolated let filesystemExecutor = FilesystemExecutor()
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        filesystemExecutor.asUnownedSerialExecutor()
+    }
+
     public nonisolated let databaseURL: URL
     private let registry: Registry
     private let cloner = APFSCloner()
     private let operationLock: OperationLock
 
+    /// Synchronously opens a registry. Prefer `open(databaseURL:)` in UI tasks.
     public init(databaseURL: URL? = nil) throws {
         let requested = databaseURL ?? Self.defaultDatabaseURL
         try WorkspacePaths.validate(requested)
@@ -25,7 +32,19 @@ public actor RiftManager {
         let lock = try OperationLock(databaseURL: database)
         self.databaseURL = database
         operationLock = lock
-        registry = try lock.withLock { try Registry(path: database) }
+        // SQLite coordinates schema setup itself. Holding the operation lock
+        // here would deadlock a progress callback that opens another manager.
+        registry = try Registry(path: database)
+    }
+
+    /// Opens the registry without blocking the calling task's executor.
+    public nonisolated static func open(databaseURL: URL? = nil) async throws -> RiftManager {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do { continuation.resume(returning: try RiftManager(databaseURL: databaseURL)) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
     }
 
     /// The same macOS database location used by the original Rift implementation.
@@ -56,6 +75,7 @@ public actor RiftManager {
             guard try WorkspaceIdentity.read(at: path) == nil else {
                 throw RiftError.markerMismatch(path)
             }
+            try WorkspaceLayout(registry: registry).validateNewWorkspace(at: path)
             progress?(.registeringWorkspace)
             let id = WorkspaceIdentity.generate()
             do {
@@ -86,6 +106,7 @@ public actor RiftManager {
             guard !WorkspacePaths.contains(source.path, prospective) else {
                 throw RiftError.insideSource(prospective)
             }
+            try WorkspaceLayout(registry: registry).validateStorage(at: prospective)
             if let name { try WorkspaceNames.validate(name) }
             try FileManager.default.createDirectory(at: prospective, withIntermediateDirectories: true)
             let parent = try WorkspacePaths.existingDirectory(prospective)
@@ -94,13 +115,14 @@ public actor RiftManager {
             if let name {
                 chosenName = name
             } else {
-                guard let generated = WorkspaceNames.generated().first(where: {
-                    !WorkspacePaths.exists(parent.appendingPathComponent($0))
+                guard let generated = try WorkspaceNames.generated().first(where: {
+                    try !WorkspacePaths.exists(parent.appendingPathComponent($0))
                 }) else { throw RiftError.namesExhausted(parent) }
                 chosenName = generated
             }
             let destination = parent.appendingPathComponent(chosenName, isDirectory: true)
-            guard !WorkspacePaths.exists(destination) else { throw RiftError.alreadyExists(destination) }
+            guard try !WorkspacePaths.exists(destination) else { throw RiftError.alreadyExists(destination) }
+            try WorkspaceLayout(registry: registry).validateNewWorkspace(at: destination)
             let id = WorkspaceIdentity.generate()
             let config = try configuration(at: source.path, hooks: options.hooks)
             try runHooks(
@@ -113,9 +135,12 @@ public actor RiftManager {
             guard try WorkspacePaths.existingDirectory(parent).path == parent.path else {
                 throw RiftError.markerMismatch(parent)
             }
+            let layout = try WorkspaceLayout(registry: registry)
+            try layout.validateStorage(at: parent)
+            try layout.validateNewWorkspace(at: destination)
             // Prepare privately, then publish without overwriting another creator's workspace.
             let staging = parent.appendingPathComponent(".rift-staging-\(id)", isDirectory: true)
-            guard !WorkspacePaths.exists(staging) else { throw RiftError.alreadyExists(staging) }
+            guard try !WorkspacePaths.exists(staging) else { throw RiftError.alreadyExists(staging) }
             var published = false
             do {
                 try cloner.copyDirectory(from: source.path, to: staging, mode: options.copyMode)
@@ -136,7 +161,7 @@ public actor RiftManager {
                 } else {
                     refusedExisting = false
                 }
-                if !refusedExisting, WorkspacePaths.exists(cleanup) { try? cloner.removeDirectory(at: cleanup) }
+                if !refusedExisting, (try? WorkspacePaths.exists(cleanup)) == true { try? cloner.removeDirectory(at: cleanup) }
                 throw error
             }
             try runHooks(
@@ -159,9 +184,7 @@ public actor RiftManager {
             let destination: URL
             if record.parentID == nil {
                 let rows = try registry.subtree(id: record.id, scope: .descendantsOnly)
-                try trash(rows: rows.filter { WorkspacePaths.exists($0.path) })
-                try FileManager.default.removeItem(at: WorkspaceIdentity.marker(at: record.path))
-                try registry.deleteActive(id: record.id)
+                try trash(rows: rows.filter { try WorkspacePaths.exists($0.path) }, unregistering: record)
                 destination = record.path
             } else {
                 try trash(rows: registry.subtree(id: record.id, scope: .includingRoot))
@@ -218,8 +241,10 @@ public actor RiftManager {
     public func garbageCollect() throws -> [URL] {
         try operationLock.withLock {
             var removed: [URL] = []
-            for row in try registry.trashedPaths() {
-                if WorkspacePaths.exists(row.path) {
+            let layout = try WorkspaceLayout(registry: registry)
+            for row in layout.trash {
+                try layout.validateCollection(of: row)
+                if try WorkspacePaths.exists(row.path) {
                     try WorkspaceIdentity.verify(at: row.path, id: row.id)
                     try cloner.removeDirectory(at: row.path)
                 }
@@ -227,9 +252,9 @@ public actor RiftManager {
                 removed.append(row.path)
             }
             var missing: [PathRecord] = []
-            for row in try registry.activePaths() where !WorkspacePaths.exists(row.path) {
+            for row in try registry.activePaths() where try !WorkspacePaths.exists(row.path) {
                 let descendants = try registry.subtree(id: row.id, scope: .descendantsOnly)
-                if !descendants.contains(where: { WorkspacePaths.exists($0.path) }) { missing.append(row) }
+                if try !descendants.contains(where: { try WorkspacePaths.exists($0.path) }) { missing.append(row) }
             }
             try registry.deleteActiveRecords(missing)
             return removed + missing.map(\.path)
@@ -294,30 +319,47 @@ public actor RiftManager {
               current.parentID == record.parentID else { throw RiftError.notManaged(record.path) }
     }
 
-    private func trash(rows: [PathRecord]) throws {
+    private func trash(rows: [PathRecord], unregistering: Record? = nil) throws {
         // Check the entire subtree before the first move.
+        let layout = try WorkspaceLayout(registry: registry)
         let targets = try rows.map { row -> MovedRecord in
-            guard WorkspacePaths.exists(row.path) else { throw RiftError.missingRift(row.path) }
+            guard try WorkspacePaths.exists(row.path) else { throw RiftError.missingRift(row.path) }
             try WorkspaceIdentity.verify(at: row.path, id: row.id)
+            try layout.validateRemoval(of: row)
             let target = try WorkspacePaths.trash(id: row.id, path: row.path)
-            guard !WorkspacePaths.exists(target) else { throw RiftError.alreadyExists(target) }
+            guard try !WorkspacePaths.exists(target) else { throw RiftError.alreadyExists(target) }
+            try layout.validateNewWorkspace(at: target)
             let parent = target.deletingLastPathComponent()
             let resolvedParent = try WorkspacePaths.prospectiveDirectory(parent)
             guard resolvedParent.path == parent.path else { throw RiftError.markerMismatch(parent) }
             return MovedRecord(id: row.id, originalPath: row.path, trashPath: target)
         }
         var moved: [MovedRecord] = []
+        var removedRootMarker = false
         do {
             for target in targets {
                 try FileManager.default.createDirectory(at: target.trashPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try WorkspacePaths.moveExclusively(from: target.originalPath, to: target.trashPath)
                 moved.append(target)
             }
-            try registry.trashMoved(moved)
+            if let unregistering {
+                try FileManager.default.removeItem(at: WorkspaceIdentity.marker(at: unregistering.path))
+                removedRootMarker = true
+            }
+            try registry.trashMoved(moved, unregisteringID: unregistering?.id)
         } catch {
             // Moves and SQL publication form one operation; restore paths on failure.
+            var failures: [String] = []
+            if removedRootMarker, let unregistering {
+                do { try WorkspaceIdentity.write(at: unregistering.path, id: unregistering.id) }
+                catch { failures.append(String(describing: error)) }
+            }
             for target in moved.reversed() {
-                try? WorkspacePaths.moveExclusively(from: target.trashPath, to: target.originalPath)
+                do { try WorkspacePaths.moveExclusively(from: target.trashPath, to: target.originalPath) }
+                catch { failures.append(String(describing: error)) }
+            }
+            if !failures.isEmpty {
+                throw RiftError.rollbackFailed(operation: "Remove workspace", message: "\(error); \(failures.joined(separator: "; "))")
             }
             throw error
         }

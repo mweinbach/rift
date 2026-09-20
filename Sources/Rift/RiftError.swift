@@ -18,6 +18,8 @@ public enum RiftError: Error, Equatable, Sendable, LocalizedError {
     case namesExhausted(URL)
     case missingRift(URL)
     case insideSource(URL)
+    case overlappingWorkspace(path: URL, other: URL)
+    case rollbackFailed(operation: String, message: String)
     case invalidConfiguration(path: URL, message: String)
     case hookFailed(hook: String, path: URL, command: String, message: String)
 
@@ -39,6 +41,8 @@ public enum RiftError: Error, Equatable, Sendable, LocalizedError {
         case let .namesExhausted(path): return "Every generated Rift name is already in use under: \(path.path)"
         case let .missingRift(path): return "Cannot remove subtree while a recorded Rift path is missing: \(path.path)"
         case let .insideSource(path): return "Cannot copy a workspace into itself: \(path.path)"
+        case let .overlappingWorkspace(path, other): return "Managed workspace paths overlap: \(path.path) and \(other.path)"
+        case let .rollbackFailed(operation, message): return "\(operation) failed and could not be fully rolled back: \(message)"
         case let .invalidConfiguration(path, message): return "Invalid Rift config at \(path.path): \(message)"
         case let .hookFailed(hook, path, command, message): return "\(hook) hook failed at \(path.path): `\(command)` \(message)"
         }

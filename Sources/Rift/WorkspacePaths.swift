@@ -60,9 +60,12 @@ internal enum WorkspacePaths {
         }
     }
 
-    static func exists(_ url: URL) -> Bool {
+    static func exists(_ url: URL) throws -> Bool {
         var info = stat()
-        return lstat(url.path, &info) == 0
+        if lstat(url.path, &info) == 0 { return true }
+        let code = errno
+        if code == ENOENT || code == ENOTDIR { return false }
+        throw RiftError.io(operation: "check path", path: url, code: code)
     }
 
     static func contains(_ directory: URL, _ candidate: URL) -> Bool {
@@ -80,6 +83,9 @@ internal enum WorkspacePaths {
     }
 
     static func trash(id: String, path: URL) throws -> URL {
+        guard !id.isEmpty, !id.contains("/"), !id.utf8.contains(0) else {
+            throw RiftError.database("Unsafe workspace identifier in trash path")
+        }
         guard path.path != "/", !path.lastPathComponent.isEmpty else {
             throw RiftError.invalidPath("Workspace has no parent or name: \(path.path)")
         }

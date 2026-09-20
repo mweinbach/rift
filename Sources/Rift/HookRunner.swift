@@ -11,6 +11,14 @@ enum HookRunner {
         parentID: String
     ) throws {
         for command in steps {
+            // Foundation raises an Objective-C exception for NUL arguments, which
+            // Swift's error handling cannot catch.
+            guard !command.utf8.contains(0) else {
+                throw RiftError.hookFailed(
+                    hook: name, path: currentDirectory, command: command,
+                    message: "command cannot contain null bytes"
+                )
+            }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
             process.arguments = ["-c", command]

@@ -27,6 +27,9 @@ struct HookConfiguration {
                 guard !run.isEmpty else {
                     throw RiftError.invalidConfiguration(path: path, message: "\(name) run cannot be empty")
                 }
+                guard !run.utf8.contains(0) else {
+                    throw RiftError.invalidConfiguration(path: path, message: "\(name) run cannot contain null bytes")
+                }
                 return run
             }
         }

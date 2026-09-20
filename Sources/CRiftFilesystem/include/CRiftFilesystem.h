@@ -32,6 +32,9 @@ int32_t rift_create_directory(const char *path);
 int32_t rift_create_hard_link(const char *existing, const char *destination);
 int32_t rift_copy_symlink(const char *source, const char *destination);
 int32_t rift_restore_cloned_file_mode(const char *destination, uint32_t mode);
+/* Prepare an owned entry for deletion, without following symbolic links. */
+int32_t rift_prepare_removal(const char *path);
+int32_t rift_remove_path(const char *path, int32_t directory);
 struct rift_metadata_error rift_copy_metadata(const char *source, const char *destination);
 
 /* Native clone tracking is optional on older macOS/APFS versions. */

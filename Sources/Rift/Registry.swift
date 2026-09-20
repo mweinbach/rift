@@ -134,20 +134,28 @@ final class Registry: @unchecked Sendable {
         try withDatabase {
             try query(
                 """
-                WITH RECURSIVE subtree(id, path, depth) AS (
-                  SELECT id, path, 0 FROM rift WHERE id = ?1
+                WITH RECURSIVE subtree(id, path, depth, trail, cycle) AS (
+                  SELECT id, path, 0, ',' || hex(id) || ',', 0 FROM rift WHERE id = ?1
                   UNION ALL
-                  SELECT rift.id, rift.path, subtree.depth + 1
+                  SELECT rift.id, rift.path, subtree.depth + 1,
+                    subtree.trail || hex(rift.id) || ',',
+                    instr(subtree.trail, ',' || hex(rift.id) || ',') > 0
                   FROM rift JOIN subtree ON rift.parent_id = subtree.id
-                ) SELECT id, path FROM subtree WHERE depth >= ?2 ORDER BY depth DESC, id
+                  WHERE subtree.cycle = 0
+                ) SELECT id, path, cycle FROM subtree WHERE depth >= ?2 ORDER BY depth DESC, id
                 """,
                 values: [.text(id), .integer(scope.minimumDepth)],
-                row: pathRecord
+                row: { statement in
+                    guard sqlite3_column_int(statement, 2) == 0 else {
+                        throw RiftError.database("Cycle detected in workspace ancestry")
+                    }
+                    return try self.pathRecord(statement)
+                }
             )
         }
     }
 
-    func trashMoved(_ moved: [MovedRecord]) throws {
+    func trashMoved(_ moved: [MovedRecord], unregisteringID: String? = nil) throws {
         try withDatabase {
             try transaction {
                 for record in moved {
@@ -156,6 +164,9 @@ final class Registry: @unchecked Sendable {
                         values: [.text(record.id), .text(record.trashPath.path), .integer(Self.timestamp())]
                     )
                     try execute("DELETE FROM rift WHERE id = ?1", values: [.text(record.id)])
+                }
+                if let unregisteringID {
+                    try execute("DELETE FROM rift WHERE id = ?1", values: [.text(unregisteringID)])
                 }
             }
         }

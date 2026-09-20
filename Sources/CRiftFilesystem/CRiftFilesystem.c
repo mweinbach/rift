@@ -95,6 +95,28 @@ int32_t rift_restore_cloned_file_mode(const char *destination, uint32_t mode) {
     return error;
 }
 
+int32_t rift_prepare_removal(const char *path) {
+    struct stat metadata;
+    if (lstat(path, &metadata) != 0) return errno;
+    uint32_t blocking_flags = UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND;
+    if ((metadata.st_flags & blocking_flags) != 0 &&
+        lchflags(path, metadata.st_flags & ~blocking_flags) != 0) {
+        return errno;
+    }
+    /* Deleting children requires writable, searchable directories. lchmod
+       never changes a symlink target, unlike chmod. Preserve other mode bits. */
+    if (S_ISDIR(metadata.st_mode) && (metadata.st_mode & 0700) != 0700 &&
+        lchmod(path, (metadata.st_mode & 07777) | 0700) != 0) {
+        return errno;
+    }
+    return 0;
+}
+
+int32_t rift_remove_path(const char *path, int32_t directory) {
+    int result = directory ? rmdir(path) : unlink(path);
+    return result == 0 ? 0 : errno;
+}
+
 static struct rift_metadata_error copy_xattrs(const char *source, const char *destination) {
     char *names = NULL;
     ssize_t names_length;

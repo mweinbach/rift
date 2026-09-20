@@ -4,6 +4,29 @@ import XCTest
 @testable import Rift
 
 final class RegistryTests: XCTestCase {
+    func testCyclicAncestryThrowsInsteadOfRecursingForever() throws {
+        try withTemporaryDirectory { directory in
+            let databaseURL = directory.appendingPathComponent("registry.sqlite")
+            let registry = try Registry(path: databaseURL)
+            let fixture = try SQLiteFixture(path: databaseURL)
+            try registry.insertRoot(id: "first,odd", path: directory.appendingPathComponent("first", isDirectory: true))
+            try registry.insertChild(id: "second", parentID: "first,odd", path: directory.appendingPathComponent("second", isDirectory: true))
+            for parentID in ["first,odd", "second"] {
+                try fixture.execute("UPDATE rift SET parent_id = \(sqlString(parentID)) WHERE id = 'first,odd'")
+                for scope in [SubtreeScope.includingRoot, .descendantsOnly] {
+                    XCTAssertThrowsError(try registry.subtree(id: "first,odd", scope: scope)) { error in
+                        guard case RiftError.database(let message) = error else {
+                            return XCTFail("Expected a database cycle failure, received \(error)")
+                        }
+                        XCTAssertTrue(message.contains("Cycle"))
+                    }
+                }
+            }
+            try fixture.execute("UPDATE rift SET parent_id = NULL WHERE id = 'first,odd'")
+            XCTAssertEqual(try registry.subtree(id: "first,odd", scope: .includingRoot).map(\.id), ["second", "first,odd"])
+        }
+    }
+
     func testOpensExistingRustSchemaWithoutChangingItsData() throws {
         try withTemporaryDirectory { directory in
             let databaseURL = directory.appendingPathComponent("registry.sqlite")

@@ -2,7 +2,7 @@ name: Swift
 
 on:
   push:
-    branches: [rift-swift]
+    branches: [main, rift-swift]
     paths:
       - Package.swift
       - Package.resolved

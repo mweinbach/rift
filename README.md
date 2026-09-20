@@ -1,6 +1,6 @@
 # Rift for Swift
 
-Rift creates independent working copies of a directory using macOS APFS copy-on-write clones. The `rift-swift` branch provides this functionality as a Swift Package Manager library, with workspace registration, parent tracking, lifecycle hooks, deferred removal, and garbage collection.
+Rift creates independent working copies of a directory using macOS APFS copy-on-write clones. This fork's `main` branch provides this functionality as a Swift Package Manager library, with workspace registration, parent tracking, lifecycle hooks, deferred removal, and garbage collection. The `rift-swift` branch also contains the Swift port.
 
 This port is experimental. Its API and implementation may change, and Swift-port performance has not been benchmarked. The original Rust implementation remains in `crates/` as an upstream reference.
 
@@ -14,7 +14,7 @@ The package exports the `Rift` library. It uses native macOS cloning and SQLite,
 
 ## Add the package
 
-Add the branch dependency and library product to your `Package.swift`:
+Add the dependency on `main` and library product to your `Package.swift`:
 
 ```swift
 // swift-tools-version: 6.0
@@ -24,7 +24,7 @@ let package = Package(
     name: "MyTool",
     platforms: [.macOS(.v13)],
     dependencies: [
-        .package(url: "https://github.com/mweinbach/rift.git", branch: "rift-swift")
+        .package(url: "https://github.com/mweinbach/rift.git", branch: "main")
     ],
     targets: [
         .executableTarget(
@@ -37,13 +37,13 @@ let package = Package(
 
 ## Use Rift
 
-`RiftManager` is an actor. Call its operations with `try await` from outside the actor:
+`RiftManager` is an actor. Open its registry asynchronously and call its operations with `try await` from outside the actor:
 
 ```swift
 import Foundation
 import Rift
 
-let manager = try RiftManager()
+let manager = try await RiftManager.open()
 let source = URL(fileURLWithPath: "/Users/me/code/app", isDirectory: true)
 
 let outcome = try await manager.initialize(at: source)
@@ -65,7 +65,7 @@ let collected = try await manager.garbageCollect()
 The default registry is `~/Library/Application Support/rift/rift.sqlite`. Pass `databaseURL:` to `RiftManager` to use an isolated registry:
 
 ```swift
-let manager = try RiftManager(databaseURL: customDatabaseURL)
+let manager = try await RiftManager.open(databaseURL: customDatabaseURL)
 let workspace = try await manager.create(
     from: source,
     name: "full-copy",
@@ -74,7 +74,9 @@ let workspace = try await manager.create(
 )
 ```
 
-Creation defaults to `.filtered`, excluding regenerable dependency and build artifacts such as `node_modules`, `target`, virtualenvs, `dist`, `build`, and `coverage`. Manifests and lockfiles remain included. `.all` clones the complete tree. Git copies detach `HEAD` while retaining the index and working-tree contents.
+Creation defaults to `.filtered`, excluding regenerable dependency and build artifacts such as SwiftPM `.build`, `node_modules`, `target`, virtualenvs, `dist`, `build`, and `coverage`. Manifests, lockfiles, and `.swiftpm` project configuration remain included. `.all` clones the complete tree. Git copies detach `HEAD` while retaining the index and working-tree contents.
+
+Managed directories must be disjoint: Rift rejects nested managed roots and workspace storage inside an existing managed or trash directory. The actor uses a dedicated serial dispatch queue for blocking filesystem and hook work. The synchronous `RiftManager(databaseURL:)` initializer remains available, but filesystem and SQLite setup can block its caller; prefer `open()` in applications.
 
 Default created-workspace storage is adjacent to the registered source root:
 

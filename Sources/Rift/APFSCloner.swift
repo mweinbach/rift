@@ -31,9 +31,9 @@ struct APFSCloner {
             throw RiftError.io(operation: "read metadata", path: destination, code: destinationCode)
         }
         // Prevent creating a directory that would become part of its own walk.
-        let sourceComponents = source.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-        let destinationComponents = destination.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-        if destinationComponents.starts(with: sourceComponents) {
+        let canonicalSource = try WorkspacePaths.existingDirectory(source)
+        let canonicalDestination = try WorkspacePaths.prospectiveDirectory(destination)
+        if WorkspacePaths.contains(canonicalSource, canonicalDestination) {
             throw RiftError.io(operation: "copy into source directory", path: destination, code: EINVAL)
         }
 
@@ -47,7 +47,67 @@ struct APFSCloner {
 
     func removeDirectory(at path: URL) throws {
         try validateFileURL(path)
-        try FileManager.default.removeItem(at: path)
+        guard try readInfo(at: path).type == Int32(RIFT_ENTRY_DIRECTORY.rawValue) else {
+            try removeEntry(at: path)
+            return
+        }
+        try prepareRemoval(at: path)
+        let marker = path.appendingPathComponent(".rift")
+        // Collection must retain its identity when any descendant cannot be
+        // deleted. Save regular marker contents for a failed final rmdir too.
+        let markerContents: Data?
+        var markerInfo = rift_file_info()
+        let markerCode = marker.withUnsafeFileSystemRepresentation { rift_read_file_info($0!, &markerInfo) }
+        if markerCode == 0 && markerInfo.type == Int32(RIFT_ENTRY_FILE.rawValue) {
+            markerContents = try Data(contentsOf: marker)
+        } else {
+            if markerCode != 0 && markerCode != ENOENT {
+                try check(markerCode, operation: "read marker metadata", path: marker)
+            }
+            markerContents = nil
+        }
+        for entry in try children(of: path) where entry.lastPathComponent != ".rift" {
+            try removeEntry(at: entry)
+        }
+        if markerCode == 0 { try removeEntry(at: marker) }
+        do {
+            try removeEmptyDirectory(at: path)
+        } catch {
+            // Parent permissions, ACLs, or a newly added child may prevent the
+            // final removal even though descendants were deleted successfully.
+            if let markerContents {
+                do { try markerContents.write(to: marker, options: .atomic) }
+                catch let restorationError {
+                    throw RiftError.rollbackFailed(
+                        operation: "Collect workspace",
+                        message: "\(error); restoring \(marker.path) failed: \(restorationError)"
+                    )
+                }
+            }
+            throw error
+        }
+    }
+
+    private func removeEntry(at path: URL) throws {
+        let info = try readInfo(at: path)
+        try prepareRemoval(at: path)
+        if info.type == Int32(RIFT_ENTRY_DIRECTORY.rawValue) {
+            for entry in try children(of: path) { try removeEntry(at: entry) }
+            try removeEmptyDirectory(at: path)
+        } else {
+            let code = path.withUnsafeFileSystemRepresentation { rift_remove_path($0!, 0) }
+            try check(code, operation: "remove entry", path: path)
+        }
+    }
+
+    private func prepareRemoval(at path: URL) throws {
+        let code = path.withUnsafeFileSystemRepresentation { rift_prepare_removal($0!) }
+        try check(code, operation: "prepare removal", path: path)
+    }
+
+    private func removeEmptyDirectory(at path: URL) throws {
+        let code = path.withUnsafeFileSystemRepresentation { rift_remove_path($0!, 1) }
+        try check(code, operation: "remove directory", path: path)
     }
 
     private func cloneFilteredDirectory(_ source: URL, to destination: URL) throws {

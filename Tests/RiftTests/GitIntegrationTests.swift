@@ -24,7 +24,7 @@ struct GitIntegrationTests {
 
     @Test(arguments: [
         "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
-        "rebase-merge", "rebase-apply", "index.lock", "HEAD.lock", "commondir",
+        "rebase-merge", "rebase-apply", "sequencer", "index.lock", "HEAD.lock", "commondir", "worktrees",
     ])
     func rejectsUnsafeGitStates(_ state: String) throws {
         let fixture = try GitFixture()
@@ -47,6 +47,84 @@ struct GitIntegrationTests {
         #expect(try fixture.read("external") == "protected\n")
     }
 
+    @Test(arguments: [
+        "objects", "objects/info", "objects/pack", "objects/00", "refs", "refs/heads", "refs/heads/main",
+        "logs", "config", "config.worktree", "index", "packed-refs", "shallow",
+    ])
+    func rejectsSymbolicAdministrativeStorage(_ metadata: String) throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.write("external", "protected\n")
+        let path = fixture.url(".git/\(metadata)")
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: path.path) {
+            try FileManager.default.removeItem(at: path)
+        }
+        try FileManager.default.createSymbolicLink(at: path, withDestinationURL: fixture.url("external"))
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+        #expect(try fixture.read("external") == "protected\n")
+    }
+
+    @Test func rejectsSharedCloneObjectAlternates() throws {
+        let fixture = try GitFixture()
+        try fixture.initializeCommit()
+        let shared = fixture.directory.deletingLastPathComponent().appendingPathComponent("\(fixture.directory.lastPathComponent)-shared")
+        defer { try? FileManager.default.removeItem(at: shared) }
+        try fixture.git(["clone", "--shared", fixture.directory.path, shared.path])
+        #expect(FileManager.default.fileExists(atPath: shared.appendingPathComponent(".git/objects/info/alternates").path))
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: shared) }
+    }
+
+    @Test(arguments: ["alternates", "http-alternates"])
+    func rejectsExternalObjectStorageButAllowsEmptyFiles(_ file: String) throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.write(".git/objects/info/\(file)", "/outside/objects\n")
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+        try fixture.write(".git/objects/info/\(file)", "\n \t\r\n")
+        #expect(try GitIntegration.checkSource(at: fixture.directory))
+    }
+
+    @Test func rejectsExplicitWorktreeConfiguration() throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.git(["config", "core.worktree", fixture.directory.path])
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
+    @Test func rejectsWorktreeConfigurationFromIncludes() throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.write("included.conf", "[core]\nworktree = \"\(fixture.directory.path)\"\n")
+        try fixture.git(["config", "include.path", fixture.url("included.conf").path])
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
+    @Test func rejectsWorktreeConfigurationFromWorktreeSettings() throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.git(["config", "extensions.worktreeConfig", "true"])
+        try fixture.write(".git/config.worktree", "[core]\nworktree = \"\(fixture.directory.path)\"\n")
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
+    @Test func rejectsUnsupportedRefStorage() throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        let config = try fixture.read(".git/config")
+        try fixture.write(".git/config", "\(config)\n[extensions]\nrefStorage = reftable\n")
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
+    @Test func rejectsBareGitMetadataAndMalformedConfiguration() throws {
+        let fixture = try GitFixture()
+        try fixture.git(["init", "--initial-branch=main"])
+        try fixture.git(["config", "core.bare", "true"])
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+        try fixture.write(".git/config", "[broken\n")
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
     @Test func appendsMarkerExclusionAndRemainsIdempotent() throws {
         let fixture = try GitFixture()
         try fixture.makeDirectory(".git")
@@ -66,6 +144,32 @@ struct GitIntegrationTests {
         try fixture.git(["init", "--initial-branch=main"])
         let head = try fixture.read(".git/HEAD")
         try GitIntegration.detachDestination(at: fixture.directory)
+        #expect(try fixture.read(".git/HEAD") == head)
+    }
+
+    @Test func refusesRepositoryWithoutHead() throws {
+        let fixture = try GitFixture()
+        try fixture.makeDirectory(".git")
+        #expect(throws: RiftError.self) { try GitIntegration.detachDestination(at: fixture.directory) }
+    }
+
+    @Test(arguments: ["invalid\n", "ref: refs/tags/missing\n", String(repeating: "0", count: 40) + "\n"])
+    func refusesInvalidHeadInsteadOfTreatingItAsUnborn(_ head: String) throws {
+        let fixture = try GitFixture()
+        try fixture.initializeCommit()
+        try fixture.write(".git/HEAD", head)
+        #expect(throws: RiftError.self) { try GitIntegration.detachDestination(at: fixture.directory) }
+        #expect(try fixture.read(".git/HEAD") == head)
+    }
+
+    @Test func refusesMissingHeadCommitInsteadOfTreatingItAsUnborn() throws {
+        let fixture = try GitFixture()
+        try fixture.initializeCommit()
+        let commit = try fixture.git(["rev-parse", "HEAD"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let object = ".git/objects/\(commit.prefix(2))/\(commit.dropFirst(2))"
+        try FileManager.default.removeItem(at: fixture.url(object))
+        let head = try fixture.read(".git/HEAD")
+        #expect(throws: RiftError.self) { try GitIntegration.detachDestination(at: fixture.directory) }
         #expect(try fixture.read(".git/HEAD") == head)
     }
 
