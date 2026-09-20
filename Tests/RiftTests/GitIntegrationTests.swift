@@ -24,13 +24,50 @@ struct GitIntegrationTests {
 
     @Test(arguments: [
         "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
-        "rebase-merge", "rebase-apply", "sequencer", "index.lock", "HEAD.lock", "commondir", "worktrees",
+        "rebase-merge", "rebase-apply", "sequencer", "commondir",
     ])
     func rejectsUnsafeGitStates(_ state: String) throws {
         let fixture = try GitFixture()
         try fixture.makeDirectory(".git")
         try fixture.write(".git/\(state)", "in progress\n")
         #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+    }
+
+    @Test(arguments: ["index.lock", "HEAD.lock", "packed-refs.lock", "gc.pid", "objects/maintenance.lock"])
+    func reportsShortLivedGitWritersAsBusy(_ state: String) throws {
+        let fixture = try GitFixture()
+        try fixture.makeDirectory(".git/objects")
+        try fixture.write(".git/\(state)", "in progress\n")
+        #expect {
+            try GitIntegration.checkSource(at: fixture.directory)
+        } throws: { error in
+            if case RiftError.gitBusy(let message) = error { return message.contains(state) }
+            return false
+        }
+        #expect(throws: RiftError.self) { try GitIntegration.detachDestination(at: fixture.directory) }
+    }
+
+    @Test func acceptsLinkedWorktreeMetadataOnlyInLiveSource() throws {
+        let fixture = try GitFixture()
+        try fixture.initializeCommit()
+        try fixture.makeDirectory(".git/worktrees/linked")
+        try fixture.write(".git/worktrees/linked/gitdir", "/elsewhere/.git\n")
+        #expect(try GitIntegration.checkSource(at: fixture.directory))
+        // A staged copy must not keep entries that point at the source's checkouts.
+        #expect(throws: RiftError.self) { try GitIntegration.detachDestination(at: fixture.directory) }
+        try GitIntegration.stripLinkedWorktrees(at: fixture.directory)
+        #expect(!FileManager.default.fileExists(atPath: fixture.url(".git/worktrees").path))
+        try GitIntegration.detachDestination(at: fixture.directory)
+    }
+
+    @Test func rejectsLinkedWorktreeMetadataThatIsNotADirectory() throws {
+        let fixture = try GitFixture()
+        try fixture.makeDirectory(".git")
+        try fixture.makeDirectory("elsewhere")
+        try FileManager.default.createSymbolicLink(at: fixture.url(".git/worktrees"), withDestinationURL: fixture.url("elsewhere"))
+        #expect(throws: RiftError.self) { try GitIntegration.checkSource(at: fixture.directory) }
+        try GitIntegration.stripLinkedWorktrees(at: fixture.directory)
+        #expect(FileManager.default.fileExists(atPath: fixture.url("elsewhere").path))
     }
 
     @Test(arguments: ["HEAD", "info", "info/exclude"])
