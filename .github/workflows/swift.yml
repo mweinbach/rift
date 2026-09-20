@@ -1,0 +1,43 @@
+name: Swift
+
+on:
+  push:
+    branches: [rift-swift]
+    paths:
+      - Package.swift
+      - Package.resolved
+      - Sources/**
+      - Tests/**
+      - Examples/SwiftPMConsumer/**
+      - .github/workflows/swift.yml
+  pull_request:
+    paths:
+      - Package.swift
+      - Package.resolved
+      - Sources/**
+      - Tests/**
+      - Examples/SwiftPMConsumer/**
+      - .github/workflows/swift.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Swift toolchain
+        run: |
+          swift --version
+          swift --version | python3 -c 'import re, sys; match = re.search(r"Swift version (\d+)", sys.stdin.read()); assert match and int(match.group(1)) >= 6, "Swift 6 or later is required"'
+      - name: Test Swift package
+        run: swift test
+      - name: Build release library
+        run: swift build -c release
+      - name: Run SwiftPM consumer smoke
+        run: swift run --package-path Examples/SwiftPMConsumer RiftExample

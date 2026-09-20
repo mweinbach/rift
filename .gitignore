@@ -1,4 +1,6 @@
 /target/
+.build/
+.swiftpm/
 /npm/rift-snapshot-linux-x64/bin/
 /npm/rift-snapshot-darwin-x64/bin/
 /npm/rift-snapshot-darwin-arm64/bin/
