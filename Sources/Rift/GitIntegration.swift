@@ -2,12 +2,40 @@ import Darwin
 import Foundation
 
 enum GitIntegration {
+    /// Validates a live source. Entries may vanish while another Git process
+    /// works; the staged copy is validated again without that allowance.
     static func checkSource(at path: URL) throws -> Bool {
+        try check(at: path, isLiveSource: true)
+    }
+
+    /// Locks and maintenance markers are short-lived, so callers may retry.
+    static func requireIdle(at path: URL) throws {
+        guard let git = try checkedGitDirectory(at: path) else { return }
+        for state in ["index.lock", "HEAD.lock", "packed-refs.lock", "gc.pid", "objects/maintenance.lock"] {
+            if try status(at: git.appendingPathComponent(state)) != nil {
+                throw RiftError.gitBusy("Git is writing the repository: \(state)")
+            }
+        }
+    }
+
+    /// A copy never owns the source's linked worktrees. Their administrative
+    /// entries point at the original checkouts, so the copy drops them.
+    static func stripLinkedWorktrees(at path: URL) throws {
+        guard let git = try checkedGitDirectory(at: path) else { return }
+        let worktrees = git.appendingPathComponent("worktrees", isDirectory: true)
+        guard try status(at: worktrees) != nil else { return }
+        // Removing a symbolic link unlinks it without following it.
+        try FileManager.default.removeItem(at: worktrees)
+    }
+
+    private static func check(at path: URL, isLiveSource: Bool) throws -> Bool {
         guard let git = try checkedGitDirectory(at: path) else { return false }
 
+        // A lock inside a staged copy means Git was writing while it was cloned.
+        try requireIdle(at: path)
         for state in [
             "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
-            "rebase-merge", "rebase-apply", "sequencer", "index.lock", "HEAD.lock",
+            "rebase-merge", "rebase-apply", "sequencer",
         ] {
             if try status(at: git.appendingPathComponent(state)) != nil {
                 throw RiftError.unsafeGit("Git state in progress: \(state)")
@@ -16,14 +44,20 @@ enum GitIntegration {
         if try status(at: git.appendingPathComponent("commondir")) != nil {
             throw RiftError.unsafeGit("shared Git metadata is not supported")
         }
-        if try status(at: git.appendingPathComponent("worktrees")) != nil {
-            throw RiftError.unsafeGit("repositories with linked worktree metadata are not supported")
+        if let worktrees = try status(at: git.appendingPathComponent("worktrees")) {
+            // A source may own linked worktrees; stripLinkedWorktrees removes
+            // them from the staged copy before this check runs there.
+            guard isLiveSource, isDirectory(worktrees) else {
+                throw RiftError.unsafeGit("linked worktree metadata must be a directory owned by the source")
+            }
         }
         for file in ["HEAD", "config", "config.worktree", "index", "packed-refs", "shallow"] {
             try requireRegularFileIfPresent(git.appendingPathComponent(file))
         }
         for directory in ["info", "objects", "refs", "logs"] {
-            try requireSafeStorageIfPresent(git.appendingPathComponent(directory, isDirectory: true))
+            try requireSafeStorageIfPresent(
+                git.appendingPathComponent(directory, isDirectory: true), toleratingChanges: isLiveSource
+            )
         }
         for file in ["alternates", "http-alternates"] {
             let alternates = git.appendingPathComponent("objects/info/\(file)")
@@ -59,7 +93,7 @@ enum GitIntegration {
     }
 
     static func detachDestination(at path: URL) throws {
-        guard try checkSource(at: path) else { return }
+        guard try check(at: path, isLiveSource: false) else { return }
         let git = path.appendingPathComponent(".git", isDirectory: true)
         let result = try runGit(at: path, arguments: ["rev-parse", "--verify", "HEAD^{commit}"])
         if result.status != 0 {
@@ -157,15 +191,24 @@ enum GitIntegration {
         return git
     }
 
-    private static func requireSafeStorageIfPresent(_ path: URL) throws {
+    private static func requireSafeStorageIfPresent(_ path: URL, toleratingChanges: Bool) throws {
         guard let metadata = try status(at: path) else { return }
         guard isDirectory(metadata) else {
             throw RiftError.unsafeGit("Git storage must be a directory, without symbolic links: \(path.path)")
         }
         var directories = [path]
         while let directory = directories.popLast() {
-            for entry in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+            let entries: [URL]
+            do {
+                entries = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            } catch let error as CocoaError where toleratingChanges && error.code == .fileReadNoSuchFile {
+                // Git removes emptied object and ref directories as it packs them.
+                continue
+            }
+            for entry in entries {
                 guard let metadata = try status(at: entry) else {
+                    // Ref locks and loose objects come and go in a live repository.
+                    if toleratingChanges { continue }
                     throw RiftError.unsafeGit("Git storage changed during validation: \(entry.path)")
                 }
                 if isDirectory(metadata) {
@@ -195,7 +238,8 @@ enum GitIntegration {
         }
         if result == 0 { return metadata }
         let code = errno
-        if code == ENOENT { return nil }
+        // A non-directory parent is reported by the check that owns that parent.
+        if code == ENOENT || code == ENOTDIR { return nil }
         throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path.path])
     }
 }

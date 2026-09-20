@@ -146,8 +146,12 @@ public actor RiftManager {
                 try cloner.copyDirectory(from: source.path, to: staging, mode: options.copyMode)
                 try WorkspaceIdentity.write(at: staging, id: id)
                 if isGit {
+                    try GitIntegration.stripLinkedWorktrees(at: staging)
                     try GitIntegration.hideMarker(at: staging)
                     try GitIntegration.detachDestination(at: staging)
+                    // Directory cloning is not atomic. A writer that started
+                    // during the copy may have left it without some objects.
+                    try GitIntegration.requireIdle(at: source.path)
                     try GitIntegration.hideMarker(at: source.path)
                 }
                 try WorkspacePaths.moveExclusively(from: staging, to: destination)

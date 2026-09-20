@@ -11,6 +11,8 @@ public enum RiftError: Error, Equatable, Sendable, LocalizedError {
     case missingMarker(URL)
     case unsupportedEntry(URL)
     case unsafeGit(String)
+    /// Another Git process holds a short-lived lock; the operation can be retried.
+    case gitBusy(String)
     case notManaged(URL)
     case markerMismatch(URL)
     case unknownMarker(URL)
@@ -34,6 +36,7 @@ public enum RiftError: Error, Equatable, Sendable, LocalizedError {
         case let .missingMarker(path): return "Rift marker is missing: \(path.path). Call initialize(at:) to restore it."
         case let .unsupportedEntry(path): return "Unsupported filesystem entry: \(path.path)"
         case let .unsafeGit(message): return "Unsafe Git source: \(message)"
+        case let .gitBusy(message): return "Git source is busy: \(message)"
         case let .notManaged(path): return "Directory is not managed by Rift: \(path.path)"
         case let .markerMismatch(path): return "Rift marker does not match the registry at: \(path.path)"
         case let .unknownMarker(path): return "Rift marker belongs to an unknown registry entry at: \(path.path)"

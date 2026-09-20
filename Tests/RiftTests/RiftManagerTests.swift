@@ -735,7 +735,7 @@ struct RiftManagerTests {
         #expect(try fixture.git(["symbolic-ref", "--short", "HEAD"]).output == "main\n")
     }
 
-    @Test("Unsafe Git operation markers reject creation before copying", arguments: ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply", "index.lock", "HEAD.lock"])
+    @Test("Unsafe Git operation markers reject creation before copying", arguments: ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"])
     func unsafeGitState(_ state: String) async throws {
         let fixture = try RiftFixture()
         try fixture.commitInitialGitRepository()
@@ -754,6 +754,44 @@ struct RiftManagerTests {
         #expect(!fixture.exists(fixture.child("unsafe")))
         let children = try await manager.list(of: fixture.source)
         #expect(children.isEmpty)
+    }
+
+    @Test("A Git writer's lock rejects creation as retryable", arguments: ["index.lock", "HEAD.lock", "gc.pid"])
+    func busyGitSource(_ state: String) async throws {
+        let fixture = try RiftFixture()
+        try fixture.commitInitialGitRepository()
+        let manager = try fixture.manager()
+        _ = try await manager.initialize(at: fixture.source)
+        let marker = fixture.source.appendingPathComponent(".git/\(state)")
+        try fixture.write("writer", to: marker)
+        await expectRiftError(matching: {
+            if case .gitBusy(let message) = $0 { return message.contains(state) }
+            return false
+        }, performing: { try await manager.create(from: fixture.source, name: "busy") })
+        #expect(!fixture.exists(fixture.child("busy")))
+        try fixture.delete(marker)
+        _ = try await manager.create(from: fixture.source, name: "busy")
+        #expect(fixture.exists(fixture.child("busy")))
+    }
+
+    @Test("A source that owns linked worktrees copies without their metadata")
+    func sourceOwningLinkedWorktrees() async throws {
+        let fixture = try RiftFixture()
+        try fixture.commitInitialGitRepository()
+        let linked = fixture.path("linked")
+        try fixture.git(["worktree", "add", "-b", "feature", linked.path])
+        let manager = try fixture.manager()
+        _ = try await manager.initialize(at: fixture.source)
+        let child = try await manager.create(from: fixture.source, name: "copy")
+
+        #expect(!fixture.exists(child.appendingPathComponent(".git/worktrees")))
+        let copied = try fixture.git(["worktree", "list", "--porcelain"], at: child).output
+        #expect(!copied.contains(linked.path))
+        // The copy can take a branch the source still has checked out elsewhere.
+        try fixture.git(["switch", "feature"], at: child)
+        let original = try fixture.git(["worktree", "list", "--porcelain"]).output
+        #expect(original.contains(linked.path))
+        #expect(try fixture.git(["status", "--porcelain"], at: linked).output.isEmpty)
     }
 
     @Test("Linked Git worktrees are rejected before copying")
